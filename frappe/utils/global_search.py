@@ -427,53 +427,40 @@ def sync_value(value: dict):
 	Sync a given document to global search
 	:param value: dict of { doctype, name, content, published, title, route }
 	"""
-	if frappe.is_oracledb:
-
-		values = {}
-
-		for k in ("doctype", "name", "content", "published", "title", "route"):
-			v = value.get(k)
-			if (r := value.get(k)) is None:
-				values[k] = 'NULL'
-			else:
-				values[k] = f"'{r}'"
-
-		frappe.db.sql(
-			"""
-			MERGE INTO {schema}."__global_search" gs
-			USING (SELECT {doctype} "doctype", {name} "name", {content} "content", {published} "published", {title} "title", {route} "route" FROM dual) st
+	print('sql values', value)
+	frappe.db.multisql(
+		{
+			"mariadb": """INSERT INTO `__global_search`
+			(`doctype`, `name`, `content`, `published`, `title`, `route`)
+			VALUES (%(doctype)s, %(name)s, %(content)s, %(published)s, %(title)s, %(route)s)
+			ON DUPLICATE key UPDATE
+				`content`=%(content)s,
+				`published`=%(published)s,
+				`title`=%(title)s,
+				`route`=%(route)s
+		""",
+			"postgres": """INSERT INTO `__global_search`
+			(`doctype`, `name`, `content`, `published`, `title`, `route`)
+			VALUES (%(doctype)s, %(name)s, %(content)s, %(published)s, %(title)s, %(route)s)
+			ON CONFLICT("doctype", "name") DO UPDATE SET
+				`content`=%(content)s,
+				`published`=%(published)s,
+				`title`=%(title)s,
+				`route`=%(route)s
+		""",
+			"oracledb": """
+			MERGE INTO "__global_search" gs
+			USING (SELECT :doctype "doctype", :name "name", :content "content", :published "published", :title "title", :route "route" FROM dual) st
 			ON (gs."doctype" = st."doctype" AND gs."name" = st."name")
 			WHEN MATCHED THEN
 			UPDATE SET gs."content" = st."content", gs."published" = st."published", gs."title" = st."title", gs."route" = st."route"
 			WHEN NOT MATCHED THEN
 			INSERT ("doctype", "name", "content", "published", "title", "route")
-			VALUES ({doctype}, {name}, {content}, {published}, {title}, {route})
-			""".format( schema=frappe.conf.db_name, **values )
-		)
-	else:
-		frappe.db.multisql(
-			{
-				"mariadb": """INSERT INTO `__global_search`
-				(`doctype`, `name`, `content`, `published`, `title`, `route`)
-				VALUES (%(doctype)s, %(name)s, %(content)s, %(published)s, %(title)s, %(route)s)
-				ON DUPLICATE key UPDATE
-					`content`=%(content)s,
-					`published`=%(published)s,
-					`title`=%(title)s,
-					`route`=%(route)s
-			""",
-				"postgres": """INSERT INTO `__global_search`
-				(`doctype`, `name`, `content`, `published`, `title`, `route`)
-				VALUES (%(doctype)s, %(name)s, %(content)s, %(published)s, %(title)s, %(route)s)
-				ON CONFLICT("doctype", "name") DO UPDATE SET
-					`content`=%(content)s,
-					`published`=%(published)s,
-					`title`=%(title)s,
-					`route`=%(route)s
-			"""
-			},
-			value,
-		)
+			VALUES (:doctype, :name, :content, :published, :title, :route)
+		"""
+		},
+		value
+	)
 
 
 def delete_for_document(doc):
@@ -562,31 +549,56 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 	results = []
 	texts = text.split("&")
 	for text in texts:
-		common_query = """ SELECT `doctype`, `name`, `content`, `title`, `route`
-			FROM `__global_search`
-			WHERE {conditions}
-			LIMIT %(limit)s OFFSET %(start)s"""
+		if frappe.conf.db_type == 'oracledb':
+			query = """SELECT doctype, name, content, title, route
+			                          FROM __global_search
+			                          WHERE {conditions}
+			                          OFFSET :start ROWS FETCH NEXT :limit ROWS ONLY"""
 
-		scope_condition = "`route` like %(scope)s AND " if scope else ""
-		published_condition = "`published` = 1 AND "
-		mariadb_conditions = postgres_conditions = " ".join([published_condition, scope_condition])
+			scope_condition = "route LIKE :scope AND " if scope else ""
+			published_condition = "published = 1 AND "
+			oracle_conditions = " ".join([published_condition, scope_condition])
 
-		# https://mariadb.com/kb/en/library/full-text-index-overview/#in-boolean-mode
-		mariadb_conditions += "MATCH(`content`) AGAINST ({} IN BOOLEAN MODE)".format(
-			frappe.db.escape("+" + text + "*")
-		)
-		postgres_conditions += f'TO_TSVECTOR("content") @@ PLAINTO_TSQUERY({frappe.db.escape(text)})'
+			# Oracle Text search using CONTAINS function
+			oracle_conditions += "CONTAINS(content, :search_query) > 0"
 
-		values = {"scope": "".join([scope, "%"]) if scope else "", "limit": limit, "start": start}
+			values = {
+				"scope": "".join([scope, "%"]) if scope else "",
+				"limit": limit,
+				"start": start,
+				"search_query": f"{text}"
+			}
+			result = frappe.db.sql(
+				query.format(conditions=oracle_conditions),
+				values=values,
+				as_dict=True,
+			)
+		else:
+			common_query = """ SELECT `doctype`, `name`, `content`, `title`, `route`
+				FROM `__global_search`
+				WHERE {conditions}
+				LIMIT %(limit)s OFFSET %(start)s"""
 
-		result = frappe.db.multisql(
-			{
-				"mariadb": common_query.format(conditions=mariadb_conditions),
-				"postgres": common_query.format(conditions=postgres_conditions),
-			},
-			values=values,
-			as_dict=True,
-		)
+			scope_condition = "`route` like %(scope)s AND " if scope else ""
+			published_condition = "`published` = 1 AND "
+			mariadb_conditions = postgres_conditions = " ".join([published_condition, scope_condition])
+
+			# https://mariadb.com/kb/en/library/full-text-index-overview/#in-boolean-mode
+			mariadb_conditions += "MATCH(`content`) AGAINST ({} IN BOOLEAN MODE)".format(
+				frappe.db.escape("+" + text + "*")
+			)
+			postgres_conditions += f'TO_TSVECTOR("content") @@ PLAINTO_TSQUERY({frappe.db.escape(text)})'
+
+			values = {"scope": "".join([scope, "%"]) if scope else "", "limit": limit, "start": start}
+
+			result = frappe.db.multisql(
+				{
+					"mariadb": common_query.format(conditions=mariadb_conditions),
+					"postgres": common_query.format(conditions=postgres_conditions),
+				},
+				values=values,
+				as_dict=True,
+			)
 		tmp_result = []
 		for i in result:
 			if i in results or not results:
